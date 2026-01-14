@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-sqlalchemy
+openai
 pydantic
 python-dotenv
-openai
