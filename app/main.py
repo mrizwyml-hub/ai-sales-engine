@@ -4,10 +4,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 
-# -------------------- APP INIT --------------------
-app = FastAPI(title="AI Travel Webhook")
+# -------------------- APP --------------------
+app = FastAPI(title="AI Travel Webhook with Memory")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# -------------------- MEMORY STORE --------------------
+# Simple in-memory storage (per contact)
+conversation_memory = {}
 
 # -------------------- MODELS --------------------
 class WebhookRequest(BaseModel):
@@ -26,7 +30,7 @@ Extract travel details from the message below.
 Message:
 "{message}"
 
-Return ONLY valid JSON in this format:
+Return ONLY valid JSON:
 {{
   "intent": "travel",
   "destination": "",
@@ -45,14 +49,14 @@ Return ONLY valid JSON in this format:
     except Exception:
         raise HTTPException(status_code=500, detail="AI parsing failed")
 
-def generate_ai_reply(destination: str, passengers: str) -> str:
+def generate_ai_reply(context: dict) -> str:
     prompt = f"""
 You are a professional travel agent.
 
-Customer wants to travel to {destination}
-Passengers: {passengers}
+Conversation context:
+{json.dumps(context, indent=2)}
 
-Write a short, polite reply.
+Reply politely and ask for missing information if needed.
 """
 
     response = client.responses.create(
@@ -65,43 +69,50 @@ Write a short, polite reply.
 # -------------------- ROUTES --------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "AI Travel Webhook is running"}
+    return {"status": "ok", "message": "AI Travel Webhook with Memory running"}
 
 @app.post("/webhook/test")
 def webhook_test(data: WebhookRequest):
 
-    # 🚫 STOP AI GUESSING
-    if is_low_information(data.text):
-        return {
-            "status": "need_more_info",
-            "stage": "Awaiting Details",
-            "message": "Could you please tell me your destination and travel date?"
+    # Initialize memory for new contact
+    if data.contact not in conversation_memory:
+        conversation_memory[data.contact] = {
+            "intent": "travel",
+            "destination": None,
+            "travel_date": None,
+            "passengers": None
         }
 
-    # ✅ AI extraction
-    ai_data = extract_travel_details(data.text)
+    memory = conversation_memory[data.contact]
 
-    # ✅ AI reply
-    ai_reply = generate_ai_reply(
-        ai_data.get("destination", "your destination"),
-        ai_data.get("passengers", "your group")
-    )
+    # If input is meaningful, extract data
+    if not is_low_information(data.text):
+        ai_data = extract_travel_details(data.text)
+
+        # Update memory with any new info
+        for key in ["destination", "travel_date", "passengers"]:
+            if ai_data.get(key):
+                memory[key] = ai_data[key]
+
+    # Generate AI reply based on memory
+    ai_reply = generate_ai_reply(memory)
+
+    # Check if all required info collected
+    completed = all(memory.values())
 
     return {
         "status": "ok",
-        "lead_id": hash(data.contact) % 100000,
-        "intent": ai_data.get("intent"),
-        "destination": ai_data.get("destination"),
-        "travel_date": ai_data.get("travel_date"),
-        "passengers": ai_data.get("passengers"),
-        "stage": "Quote Ready",
+        "contact": data.contact,
+        "memory": memory,
+        "stage": "Quote Ready" if completed else "Collecting Details",
         "ai_reply": ai_reply
     }
 
 @app.post("/webhook/reset/{contact}")
 def reset_lead(contact: str):
+    conversation_memory.pop(contact, None)
     return {
         "status": "reset",
         "contact": contact,
-        "message": "Lead reset successfully"
+        "message": "Conversation memory cleared"
     }
