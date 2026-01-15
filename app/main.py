@@ -1,24 +1,25 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from openai import OpenAI
 
-# -------------------- APP --------------------
+# ================== APP ==================
 app = FastAPI(title="AI Travel Webhook with Memory")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# -------------------- MEMORY STORE --------------------
-# Simple in-memory storage (per contact)
+VERIFY_TOKEN = "my_verify_token_123"  # MUST match Meta dashboard
+
+# ================== MEMORY ==================
 conversation_memory = {}
 
-# -------------------- MODELS --------------------
+# ================== MODELS ==================
 class WebhookRequest(BaseModel):
     contact: str
     text: str
 
-# -------------------- HELPERS --------------------
+# ================== HELPERS ==================
 def is_low_information(text: str) -> bool:
     text = text.strip()
     return len(text) < 5 or text.isdigit()
@@ -66,15 +67,28 @@ Reply politely and ask for missing information if needed.
 
     return response.output_text.strip()
 
-# -------------------- ROUTES --------------------
+# ================== ROUTES ==================
+
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "AI Travel Webhook with Memory running"}
+    return {"status": "ok", "message": "AI Travel Webhook running"}
 
+# ✅ REQUIRED BY META (DO NOT REMOVE)
+@app.get("/webhook/whatsapp")
+async def verify_whatsapp(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return int(challenge)
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+# ✅ TEST ENDPOINT (YOU ALREADY USED THIS)
 @app.post("/webhook/test")
 def webhook_test(data: WebhookRequest):
 
-    # Initialize memory for new contact
     if data.contact not in conversation_memory:
         conversation_memory[data.contact] = {
             "intent": "travel",
@@ -85,19 +99,15 @@ def webhook_test(data: WebhookRequest):
 
     memory = conversation_memory[data.contact]
 
-    # If input is meaningful, extract data
     if not is_low_information(data.text):
         ai_data = extract_travel_details(data.text)
 
-        # Update memory with any new info
         for key in ["destination", "travel_date", "passengers"]:
             if ai_data.get(key):
                 memory[key] = ai_data[key]
 
-    # Generate AI reply based on memory
     ai_reply = generate_ai_reply(memory)
 
-    # Check if all required info collected
     completed = all(memory.values())
 
     return {
