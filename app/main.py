@@ -1,128 +1,129 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, Request
+import requests
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ================== APP ==================
-app = FastAPI(title="AI Travel Webhook with Memory")
+# -------------------- APP --------------------
+app = FastAPI(title="AI Travel WhatsApp Bot")
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# -------------------- ENV --------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 
-VERIFY_TOKEN = "my_verify_token_123"  # MUST match Meta dashboard
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ================== MEMORY ==================
+# -------------------- MEMORY --------------------
 conversation_memory = {}
 
-# ================== MODELS ==================
-class WebhookRequest(BaseModel):
-    contact: str
-    text: str
-
-# ================== HELPERS ==================
+# -------------------- HELPERS --------------------
 def is_low_information(text: str) -> bool:
-    text = text.strip()
-    return len(text) < 5 or text.isdigit()
+    return len(text.strip()) < 5 or text.strip().isdigit()
 
 def extract_travel_details(message: str) -> dict:
     prompt = f"""
-Extract travel details from the message below.
+Extract travel details from the message.
 
 Message:
 "{message}"
 
-Return ONLY valid JSON:
+Return JSON only:
 {{
-  "intent": "travel",
   "destination": "",
   "travel_date": "",
   "passengers": ""
 }}
 """
-
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt
     )
+    return json.loads(response.output_text)
 
-    try:
-        return json.loads(response.output_text)
-    except Exception:
-        raise HTTPException(status_code=500, detail="AI parsing failed")
-
-def generate_ai_reply(context: dict) -> str:
+def generate_ai_reply(memory: dict) -> str:
     prompt = f"""
 You are a professional travel agent.
 
-Conversation context:
-{json.dumps(context, indent=2)}
+Conversation memory:
+{json.dumps(memory, indent=2)}
 
-Reply politely and ask for missing information if needed.
+Reply politely and ask for missing info.
 """
-
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=prompt
     )
-
     return response.output_text.strip()
 
-# ================== ROUTES ==================
+def send_whatsapp_message(to: str, message: str):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": message}
+    }
+
+    r = requests.post(url, headers=headers, json=payload)
+    if r.status_code != 200:
+        print("WhatsApp send error:", r.text)
+
+# -------------------- ROUTES --------------------
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "AI Travel Webhook running"}
+    return {"status": "ok", "message": "WhatsApp AI running"}
 
-# ✅ REQUIRED BY META (DO NOT REMOVE)
+# 🔐 Webhook verification
 @app.get("/webhook/whatsapp")
-async def verify_whatsapp(request: Request):
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return int(challenge)
+async def verify_webhook(request: Request):
+    params = request.query_params
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == VERIFY_TOKEN
+    ):
+        return int(params.get("hub.challenge"))
 
     raise HTTPException(status_code=403, detail="Verification failed")
 
-# ✅ TEST ENDPOINT (YOU ALREADY USED THIS)
-@app.post("/webhook/test")
-def webhook_test(data: WebhookRequest):
+# 📩 Incoming WhatsApp messages
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    payload = await request.json()
 
-    if data.contact not in conversation_memory:
-        conversation_memory[data.contact] = {
-            "intent": "travel",
+    try:
+        message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+        contact = message["from"]
+        text = message["text"]["body"]
+    except Exception:
+        return {"status": "ignored"}
+
+    # Init memory
+    if contact not in conversation_memory:
+        conversation_memory[contact] = {
             "destination": None,
             "travel_date": None,
             "passengers": None
         }
 
-    memory = conversation_memory[data.contact]
+    memory = conversation_memory[contact]
 
-    if not is_low_information(data.text):
-        ai_data = extract_travel_details(data.text)
+    if not is_low_information(text):
+        extracted = extract_travel_details(text)
+        for k in memory:
+            if extracted.get(k):
+                memory[k] = extracted[k]
 
-        for key in ["destination", "travel_date", "passengers"]:
-            if ai_data.get(key):
-                memory[key] = ai_data[key]
+    reply = generate_ai_reply(memory)
 
-    ai_reply = generate_ai_reply(memory)
+    # 🔥 SEND MESSAGE BACK TO WHATSAPP
+    send_whatsapp_message(contact, reply)
 
-    completed = all(memory.values())
-
-    return {
-        "status": "ok",
-        "contact": data.contact,
-        "memory": memory,
-        "stage": "Quote Ready" if completed else "Collecting Details",
-        "ai_reply": ai_reply
-    }
-
-@app.post("/webhook/reset/{contact}")
-def reset_lead(contact: str):
-    conversation_memory.pop(contact, None)
-    return {
-        "status": "reset",
-        "contact": contact,
-        "message": "Conversation memory cleared"
-    }
+    return {"status": "sent"}
